@@ -1,0 +1,12 @@
+﻿################################################################################
+# This .gitignore file was automatically created by Microsoft(R) Visual Studio.
+################################################################################
+
+/IPS.NET.CLI/bin/Debug/net8.0
+/IPS.NET.CLI/obj
+/IPS.NET/obj
+/.vs
+/IPS.NET/bin/Debug/net8.0
+/IPS.NET.Core/.vs/IPS.NET.Core
+/IPS.NET.Core/obj
+/IPS.NET.Test/obj
