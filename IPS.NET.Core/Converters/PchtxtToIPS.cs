@@ -1,113 +1,131 @@
-﻿namespace IPS.NET.Core.Converters
+﻿using IPS.NET.Core.Extensions;
+using Revrs;
+using System.Globalization;
+
+namespace IPS.NET.Core.Converters;
+
+public class PchtxtToIPS
 {
-    using System;
-    using System.IO;
-    using System.Globalization;
+    private const string ENABLED_KEYWORD = "@enabled";
+    private const string STOP_KEYWORD = "@stop";
 
-    public class PchtxtToIPS
+    private static readonly Exception _invalidNsoidException = new InvalidDataException("""
+        Could not locate NSOBID in pchtxt header.
+        """);
+
+    private static readonly Exception _invalidPchtxtException = new InvalidDataException("""
+        Could not identify IPS type from pchtxt entries.
+        """);
+
+    private enum Type
     {
-        private const int IPS_ADDRESS_SIZE = 3;
-        private const int IPS32_ADDRESS_SIZE = 4;
-        private const int NSO_HEADER_LEN = 0x100;
-        private static readonly byte[] IPS_HEAD_MAGIC = { 0x50, 0x41, 0x54, 0x43, 0x48 }; // "PATCH"
-        private static readonly byte[] IPS32_HEAD_MAGIC = { 0x49, 0x50, 0x53, 0x33, 0x32 }; // "IPS32"
-        private static readonly byte[] IPS_FOOT_MAGIC = { 0x45, 0x4F, 0x46 }; // "EOF"
-        private static readonly byte[] IPS32_FOOT_MAGIC = { 0x45, 0x45, 0x4F, 0x46 }; // "EEOF"
+        None,
+        IPS = 3,
+        IPS32 = 4,
+    }
+    
+    private enum State
+    {
+        None,
+        Address,
+        Value,
+        Comment,
+    }
 
-        public static void ConvertPchtxtToIps(string pchtxtPath, string outputDirectory)
-        {
-            string[] lines = File.ReadAllLines(pchtxtPath);
-            byte[] headMagic = null;
-            byte[] footMagic = null;
-            int addressSize = 0;
-            string outputFileName = null;
+    public static void ConvertPchtxtToIps(string pchtxtPath, string outputDirectory)
+    {
+        string text = File.ReadAllText(pchtxtPath);
+        if (text.Length < 8) {
+            throw _invalidNsoidException;
+        }
 
-            // Extract the NSO bid from the first line and set the output file name
-            if (lines.Length > 0 && lines[0].StartsWith("@nsobid-"))
-            {
-                outputFileName = lines[0].Substring(8).Trim() + ".ips";
-            }
-            else
-            {
-                throw new InvalidOperationException("NSO bid not found in the pchtxt file");
-            }
+        ReadOnlySpan<char> utf16 = text;
+        int endOfLineIndex = utf16.IndexOf('\n');
+        ReadOnlySpan<char> nsoid = utf16[8..endOfLineIndex];
+        if (nsoid[^1] is '\r') {
+            nsoid = utf16[..^1];
+        }
 
-            // Find the first line with actual patch data to determine address size
-            foreach (string line in lines)
-            {
-                if (!string.IsNullOrWhiteSpace(line) && !line.StartsWith("@") && !line.StartsWith("//"))
-                {
-                    string[] parts = line.Trim().Split();
-                    int addressLength = parts[0].Length / 2;
+        string output = Path.Combine(outputDirectory, $"{nsoid}.ips");
 
-                    if (addressLength == IPS_ADDRESS_SIZE)
-                    {
-                        headMagic = IPS_HEAD_MAGIC;
-                        footMagic = IPS_FOOT_MAGIC;
-                        addressSize = IPS_ADDRESS_SIZE;
-                        break;
+        Directory.CreateDirectory(outputDirectory);
+        using FileStream fs = File.Create(output);
+
+        ConvertPchtxtToIps(utf16, fs);
+    }
+
+    public static void ConvertPchtxtToIps(ReadOnlySpan<char> text, Stream output)
+    {
+        int enabledBlockStartIndex = text.IndexOf(ENABLED_KEYWORD) + ENABLED_KEYWORD.Length;
+        int enabledBlockEndIndex = enabledBlockStartIndex + text[enabledBlockStartIndex..].IndexOf(STOP_KEYWORD);
+        ReadOnlySpan<char> enabledBlock = text[enabledBlockStartIndex..enabledBlockEndIndex];
+
+        RevrsWriter writer = new(output, Endianness.Big);
+        writer.Move(5);
+
+        int addressSize = 0;
+        Type type = Type.None;
+
+        State state = State.None;
+        int valueRangeStart = 0;
+        int valueSize = 0;
+
+        int addressBytePos = 0;
+
+        for (int i = 0; i < enabledBlock.Length; i++) {
+            char @char = enabledBlock[i];
+            switch (@char) {
+                case '\r' or '\n':
+                    if (valueSize > 0) {
+                        writer.Write((ushort)(valueSize / 2));
+                        writer.WriteHex(enabledBlock[valueRangeStart..(valueRangeStart + valueSize)]);
                     }
-                    else if (addressLength == IPS32_ADDRESS_SIZE)
-                    {
-                        headMagic = IPS32_HEAD_MAGIC;
-                        footMagic = IPS32_FOOT_MAGIC;
-                        addressSize = IPS32_ADDRESS_SIZE;
-                        break;
+
+                    valueRangeStart = valueSize = addressSize = 0;
+                    state = State.Address;
+                    addressBytePos = 0;
+                    break;
+                case ' ':
+                    switch (state) {
+                        case State.Address:
+                            valueRangeStart = i + 1;
+                            state = State.Value;
+                            type = (Type)addressSize;
+                            break;
+                        default:
+                            state = State.Comment;
+                            break;
                     }
-                    else
-                    {
-                        throw new InvalidOperationException("Unsupported address size in pchtxt file");
+                    break;
+                default:
+                    switch (state) {
+                        case State.Address:
+                            writer.Write((byte)(byte.Parse(enabledBlock[i..(++i + 1)], NumberStyles.HexNumber) + addressBytePos switch {
+                                2 => 1,
+                                _ => 0
+                            }));
+                            addressSize++;
+                            addressBytePos++;
+                            break;
+                        case State.Value:
+                            valueSize++;
+                            break;
                     }
-                }
-            }
-
-            if (headMagic == null || footMagic == null)
-            {
-                throw new InvalidOperationException("No valid patch data found in pchtxt file");
-            }
-
-            string outputPath = Path.Combine(outputDirectory, outputFileName);
-            using (FileStream ipsFile = new FileStream(outputPath, FileMode.Create, FileAccess.Write))
-            {
-                ipsFile.Write(headMagic, 0, headMagic.Length);
-
-                foreach (string line in lines)
-                {
-                    if (!string.IsNullOrWhiteSpace(line) && !line.StartsWith("@") && !line.StartsWith("//"))
-                    {
-                        string[] parts = line.Trim().Split();
-                        int address = int.Parse(parts[0], NumberStyles.HexNumber) + NSO_HEADER_LEN;
-                        byte[] value = HexStringToByteArray(parts[1]);
-
-                        // Write address
-                        byte[] addressBytes = BitConverter.GetBytes(address);
-                        Array.Reverse(addressBytes); // Convert to big-endian
-                        ipsFile.Write(addressBytes, addressBytes.Length - addressSize, addressSize);
-
-                        // Write length of the patch
-                        ushort length = (ushort)value.Length;
-                        byte[] lengthBytes = BitConverter.GetBytes(length);
-                        Array.Reverse(lengthBytes); // Convert to big-endian
-                        ipsFile.Write(lengthBytes, lengthBytes.Length - 2, 2);
-
-                        // Write the patch value
-                        ipsFile.Write(value, 0, value.Length);
-                    }
-                }
-
-                ipsFile.Write(footMagic, 0, footMagic.Length);
+                    break;
             }
         }
 
-        private static byte[] HexStringToByteArray(string hex)
-        {
-            int length = hex.Length;
-            byte[] bytes = new byte[length / 2];
-            for (int i = 0; i < length; i += 2)
-            {
-                bytes[i / 2] = Convert.ToByte(hex.Substring(i, 2), 16);
-            }
-            return bytes;
-        }
+        writer.Write(type switch {
+            Type.IPS => "EOF"u8,
+            Type.IPS32 => "EEOF"u8,
+            _ => throw _invalidPchtxtException
+        });
+
+        writer.Seek(position: 0);
+        writer.Write(type switch {
+            Type.IPS => "PATCH"u8,
+            Type.IPS32 => "IPS32"u8,
+            _ => throw _invalidPchtxtException
+        });
     }
 }
