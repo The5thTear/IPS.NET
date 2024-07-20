@@ -97,6 +97,9 @@ public class PchtxtToIPS
                             break;
                     }
                     break;
+                case '@':
+                    state = State.Comment;
+                    break;
                 default:
                     switch (state) {
                         case State.Address:
